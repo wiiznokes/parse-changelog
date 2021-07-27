@@ -1,0 +1,147 @@
+name: Fuzz
+
+permissions:
+  contents: read
+
+on:
+  # Enable when running fuzzing on a branch.
+  push:
+    branches:
+      - fuzz
+  schedule:
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+  FUZZ_MAX_TOTAL_TIME: 1200 # 20 minutes
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        fuzzer:
+          - libfuzzer
+          - afl
+          - honggfuzz
+        target:
+          - parse
+    env:
+      CARGO_FUZZ_VERSION: 0.10.2
+      HONGGFUZZ_VERSION: 0.5.54
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/github-actions/install-rust@main
+
+      - name: Pre Cache
+        run: |
+          mkdir -p .github/caching
+          echo "$CARGO_FUZZ_VERSION" > .github/caching/cargo-fuzz.lock
+          echo "$HONGGFUZZ_VERSION" > .github/caching/honggfuzz.lock
+          echo "${{ runner.tool_cache }}/cargo/bin" >> "$GITHUB_PATH"
+      - name: Cache libfuzzer corpus
+        uses: actions/cache@v2
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: libfuzzer-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: libfuzzer-corpus-${{ matrix.target }}-
+        if: matrix.fuzzer == 'libfuzzer'
+      - name: Cache cargo-fuzz
+        id: cache-cargo-fuzz
+        uses: actions/cache@v2
+        with:
+          path: ${{ runner.tool_cache }}/cargo/bin
+          key: cargo-fuzz-bin-${{ hashFiles('.github/caching/cargo-fuzz.lock') }}
+        if: matrix.fuzzer == 'libfuzzer'
+      - name: Cache honggfuzz
+        id: cache-honggfuzz
+        uses: actions/cache@v2
+        with:
+          path: ${{ runner.tool_cache }}/cargo/bin
+          key: honggfuzz-bin-${{ hashFiles('.github/caching/honggfuzz.lock') }}
+        if: matrix.fuzzer == 'honggfuzz'
+      - name: Install cargo-fuzz
+        run: cargo install -f cargo-fuzz --version "$CARGO_FUZZ_VERSION" --root ${{ runner.tool_cache }}/cargo
+        if: matrix.fuzzer == 'libfuzzer' && steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
+      - name: Install honggfuzz
+        run: cargo install -f honggfuzz --version "$HONGGFUZZ_VERSION" --root ${{ runner.tool_cache }}/cargo
+        if: matrix.fuzzer == 'honggfuzz' && steps.cache-honggfuzz.outputs.cache-hit != 'true'
+
+      - name: Fuzzing with libFuzzer
+        run: |
+          set -x
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cargo fuzz run --release --sanitizer=none ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- -max_total_time="$FUZZ_MAX_TOTAL_TIME"
+          cargo fuzz cmin ${{ matrix.target }}
+        if: matrix.fuzzer == 'libfuzzer'
+      - name: Fuzzing with AFL
+        run: |
+          set -x
+          # Cannot use cache because afl.rs requires that the cargo-afl binary and the afl library be built with the same version of the compiler.
+          cargo install afl
+          echo 'core' | sudo tee /proc/sys/kernel/core_pattern
+          cargo afl build --release
+          cargo afl fuzz -i ../seeds/${{ matrix.target }} -o out -V "$FUZZ_MAX_TOTAL_TIME" target/release/${{ matrix.target }}
+          rmdir out/default/crashes &>/dev/null || true
+          rmdir out/default/hangs &>/dev/null || true
+          if [[ -d out/default/crashes ]] || [[ -d out/default/hangs ]]; then
+            exit 1
+          fi
+        if: matrix.fuzzer == 'afl'
+        working-directory: fuzz/afl
+      - name: Fuzzing with Honggfuzz
+        run: |
+          set -x
+          sudo apt-get install --no-install-recommends -y binutils-dev libunwind8-dev
+          HFUZZ_RUN_ARGS="--run_time $FUZZ_MAX_TOTAL_TIME --exit_upon_crash" \
+            RUSTFLAGS="$RUSTFLAGS -Z sanitizer=address" \
+            cargo hfuzz run ${{ matrix.target }}
+        if: matrix.fuzzer == 'honggfuzz'
+        working-directory: fuzz/honggfuzz
+
+      - name: Archive artifacts
+        run: |
+          set -x
+          cd fuzz
+          rmdir artifacts/${{ matrix.target }} &>/dev/null || true
+          rmdir corpus/${{ matrix.target }} &>/dev/null || true
+          if [[ -d artifacts/${{ matrix.target }} ]]; then
+            tar acvf ../libfuzzer-artifacts-${{ matrix.target }}.tar.xz artifacts/${{ matrix.target }}
+          fi
+          if [[ -d corpus/${{ matrix.target }} ]]; then
+            tar acvf ../libfuzzer-corpus-${{ matrix.target }}.tar.xz corpus/${{ matrix.target }}
+          fi
+          cd afl
+          if [[ -d out/default ]]; then
+            tar acvf ../../afl-artifacts-${{ matrix.target }}.tar.xz out/default
+          fi
+        if: always()
+      - name: Upload libfuzzer artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: libfuzzer-artifacts-${{ matrix.target }}
+          path: libfuzzer-artifacts-${{ matrix.target }}.tar.xz
+        if: failure() && matrix.fuzzer == 'libfuzzer'
+      - name: Upload libfuzzer corpus
+        uses: actions/upload-artifact@v2
+        with:
+          name: libfuzzer-corpus-${{ matrix.target }}
+          path: libfuzzer-corpus-${{ matrix.target }}.tar.xz
+        if: always() && matrix.fuzzer == 'libfuzzer'
+      - name: Upload afl artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: afl-artifacts-${{ matrix.target }}
+          path: afl-artifacts-${{ matrix.target }}.tar.xz
+        if: always() && matrix.fuzzer == 'afl'

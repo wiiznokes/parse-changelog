@@ -96,9 +96,13 @@ jobs:
       - uses: taiki-e/github-actions/install-rust@main
       - run: cargo install cargo-fuzz --debug
       - run: cargo install afl --debug
+      - run: cargo install honggfuzz --debug
+      - run: sudo apt-get install --no-install-recommends -y binutils-dev libunwind8-dev
       - run: cargo fuzz build
       - run: cargo afl build
         working-directory: fuzz/afl
+      - run: cargo honggfuzz build
+        working-directory: fuzz/honggfuzz
 
   tidy:
     runs-on: ubuntu-18.04
