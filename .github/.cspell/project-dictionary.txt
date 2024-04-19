@@ -1,7 +1,6 @@
 acvf
 binstall
 keepachangelog
-makedeb
 memmem
 setext
 unparse
